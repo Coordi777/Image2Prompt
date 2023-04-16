@@ -5,12 +5,9 @@ from PIL import Image
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
-import numpy as np
-from transformers import AutoModel, AutoProcessor, CLIPProcessor, CLIPModel
+from transformers import CLIPProcessor, CLIPModel
 from torch.utils.tensorboard import SummaryWriter
 from sentence_transformers import SentenceTransformer
-from torchvision import transforms
-from collections import namedtuple
 from transformers import get_constant_schedule_with_warmup
 from torch.utils.data.distributed import DistributedSampler
 from transformers.trainer_pt_utils import SequentialDistributedSampler
@@ -49,7 +46,7 @@ class ImageDataset(Dataset):
             image = image['pixel_values'].squeeze()
         if self.transform_prt is not None:
             prompt = self.transform_prt.encode(prompt, convert_to_tensor=True)
-        return image, prompt
+        return image.to('cpu'), prompt.to('cpu')
 
 
 def cosine_similarity_loss(pred, target):
@@ -112,14 +109,14 @@ train_size = int(0.8 * len(dataset_all))
 test_size = len(dataset_all) - train_size
 train_dataset, test_dataset = torch.utils.data.random_split(dataset_all, [train_size, test_size])
 train_sampler = DistributedSampler(train_dataset, shuffle=True)
-train_loader = DataLoader(train_dataset, batch_size=24, sampler=train_sampler, num_workers=0)
+train_loader = DataLoader(train_dataset, batch_size=128, sampler=train_sampler, num_workers=32)
 test_sampler = SequentialDistributedSampler(test_dataset, batch_size=64)
-testloader = DataLoader(test_dataset, batch_size=64, sampler=test_sampler, num_workers=0)
+testloader = DataLoader(test_dataset, batch_size=64, sampler=test_sampler, num_workers=32)
 
 if local_rank == 0:
     print(f"test size: {len(train_dataset)}, train size: {len(test_dataset)}")
 
-optimizer = AdamW(model.parameters(), lr=1e-4)
+optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
 optimizer.zero_grad()
 num_training_steps = NEPOCH * len(train_loader)
 lr_scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=int(0.01 * num_training_steps))
@@ -142,11 +139,8 @@ for epoch in range(NEPOCH):
         step = step + 1
         progress_bar.set_postfix(loss=loss.item())
         progress_bar.update(1)
-        writer.add_scalar('train_loss80', loss, step)
+        writer.add_scalar('train_loss_freeze80', loss, step)
     epoch_loss /= len(train_loader)
-    if local_rank == 0:
-        print(f"epoch: {epoch}, training loss: {epoch_loss}")
-    writer.add_scalar('epoch_loss80', epoch_loss, epoch)
 
     """test loss"""
     epoch_loss = 0
@@ -161,7 +155,7 @@ for epoch in range(NEPOCH):
         loss_eval = distributed_concat(torch.stack(losses),
                                        len(test_sampler.dataset))
         epoch_loss = torch.mean(loss_eval)
-        writer.add_scalar('eval_loss80', epoch_loss, step)
+        writer.add_scalar('eval_loss_freeze80', epoch_loss, step)
     if local_rank == 0:
         print(f"epoch: {epoch}, test loss: {epoch_loss}")
     model.train()
@@ -170,7 +164,7 @@ for epoch in range(NEPOCH):
             BestSim = epoch_loss
             BestEpoch = epoch + 1
             print(f"save best model at {BestSim} with epoch {BestEpoch}")
-            torch.save(model.state_dict(), f"best_model_80.pt")
+            torch.save(model.state_dict(), f"best_model_freeze80.pt")
     torch.distributed.barrier()
     if local_rank == 0:
         if epoch - 3 > BestEpoch:
